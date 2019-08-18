@@ -135,38 +135,6 @@ func (fs *FS) Root() (fspkg.Node, error) {
 	}, nil
 }
 
-// imagesOfHost returns the images for the given registry host and
-// owner (e.g. GCP project name).
-//
-// Note that this is gcr.io specific as there's no way in the Registry
-// protocol to do this. So this won't work for index.docker.io. We'll
-// need to do something else there.
-// TODO: something else for docker hub.
-func (fs *FS) imagesOfHost(ctx context.Context, host, owner string) (imageNames []string, err error) {
-	req, err := http.NewRequest("GET", "https://"+host+"/v2/"+owner+"/tags/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	// TODO: auth. This works for public stuff so far, though.
-	req = req.WithContext(ctx)
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return nil, errors.New(res.Status)
-	}
-	var resj struct {
-		Images []string `json:"child"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&resj); err != nil {
-		return nil, err
-	}
-	sort.Strings(resj.Images)
-	return resj.Images, nil
-}
-
 type manifest struct {
 	SchemaVersion int        `json:"schemaVersion"`
 	MediaType     string     `json:"mediaType"`
@@ -180,8 +148,23 @@ type blobRef struct {
 	Digest    string `json:"digest"`
 }
 
+var validTwoLevelRepoName = regexp.MustCompile(`^[^/]+/[^/]+$`)
+
+func schemeByHost(host string) (scheme string, err error) {
+	reg, err := namepkg.NewRegistry(host)
+	if err != nil {
+		log.Printf("bad name: %v", err)
+		return "", err
+	}
+	return reg.Scheme(), nil
+}
+
 func (fs *FS) getManifest(ctx context.Context, host, owner, image, ref string) (*manifest, error) {
-	urlStr := "https://" + host + "/v2/" + owner + "/" + image + "/manifests/" + ref
+	scheme, err := schemeByHost(host)
+	if err != nil {
+		return nil, err
+	}
+	urlStr := scheme + "://" + host + "/v2/" + owner + "/" + image + "/manifests/" + ref
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
 		return nil, err
@@ -206,7 +189,11 @@ func (fs *FS) getManifest(ctx context.Context, host, owner, image, ref string) (
 }
 
 func (fs *FS) getConfig(ctx context.Context, host, owner, image, ref string) (string, error) {
-	urlStr := "https://" + host + "/v2/" + owner + "/" + image + "/blobs/" + ref
+	scheme, err := schemeByHost(host)
+	if err != nil {
+		return "", err
+	}
+	urlStr := scheme + "://" + host + "/v2/" + owner + "/" + image + "/blobs/" + ref
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
 		return "", err
@@ -223,6 +210,223 @@ func (fs *FS) getConfig(ctx context.Context, host, owner, image, ref string) (st
 	}
 	slurp, err := ioutil.ReadAll(res.Body)
 	return string(slurp), err
+}
+func (fs *FS) getRepositories(ctx context.Context, host string) (repositories []string, err error) {
+	scheme, err := schemeByHost(host)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("GET", scheme+"://"+host+"/v2/_catalog", nil)
+	if err != nil {
+		return nil, err
+	}
+	// TODO: auth. This works for public stuff so far, though.
+	req = req.WithContext(ctx)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil, errors.New(res.Status)
+	}
+	var resj struct {
+		Repositories []string `json:"repositories"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&resj); err != nil {
+		return nil, err
+	}
+	return resj.Repositories, nil
+}
+func (fs *FS) getTags(ctx context.Context, host, owner, image string) (tags []string, err error) {
+	scheme, err := schemeByHost(host)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("GET", scheme+"://"+host+"/v2/"+owner+"/"+image+"/tags/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	// TODO: auth. This works for public stuff so far, though.
+	req = req.WithContext(ctx)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil, errors.New(res.Status)
+	}
+	var resj struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&resj); err != nil {
+		return nil, err
+	}
+	return resj.Tags, nil
+}
+
+// registryController is a separeted low-level component that deal with
+// registry-specific API to get lists of:
+// - Owners of a host
+// - Images of an owner
+// - Tags digests and the map from these digests to tag names, of an image
+type registryController interface {
+	ownersOfHost(host string) (ownerNames []string, err error)
+	imagesOfOwner(host, owner string) (imageNames []string, err error)
+	tagsOfImage(host, owner, image string) (tagDigests []string, tagsMap map[string] string, err error)
+}
+
+type defaultRegistryController struct {
+	ctx context.Context
+	fs  *FS
+}
+
+func (dl *defaultRegistryController) ownersOfHost(host string) (ownerNames []string, err error) {
+	repos, err := dl.fs.getRepositories(dl.ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	// TODO: Support any depth of repository name, not only two level.
+	for _, r := range repos {
+		if validTwoLevelRepoName.MatchString(r) {
+			subR := strings.Split(r, "/")
+			ownerNames = append(ownerNames, subR[0])
+		}
+	}
+	sort.Strings(ownerNames)
+	return ownerNames, nil
+}
+
+func (dl *defaultRegistryController) imagesOfOwner(host, owner string) (imageNames []string, err error) {
+	repos, err := dl.fs.getRepositories(dl.ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	// TODO: Support any depth of repository name, not only two level.
+	for _, r := range repos {
+		if validTwoLevelRepoName.MatchString(r) {
+			subR := strings.Split(r, "/")
+			if subR[0] == owner {
+				imageNames = append(imageNames, subR[1])
+			}
+		}
+	}
+	sort.Strings(imageNames)
+	return imageNames, nil
+}
+
+func (dl *defaultRegistryController) tagsOfImage (host, owner, image string) (tagDigests []string, tagsMap map[string] string, err error) {
+	rt, err := dl.fs.getTags(dl.ctx, host, owner, image)
+	if err != nil {
+		return nil, nil, err
+	}
+	tags := []string{}
+	m := map[string]string{}
+	for _, t := range rt {
+		if d, err := dl.digestOfTag(host, owner, image, t) ; err == nil {
+			tags = append(tags, d)
+			m[t] = d
+		} else {
+			return nil, nil, err
+		}
+	}
+	sort.Strings(tags)
+	return tags, m, nil
+}
+
+func (dl *defaultRegistryController) digestOfTag(host, owner, image, tag string) (digest string, err error) {
+	scheme, err := schemeByHost(host)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest("HEAD", scheme+"://"+host+"/v2/"+owner+"/"+image+"/manifests/"+tag, nil)
+	if err != nil {
+		return "", err
+	}
+	// TODO: auth. This works for public stuff so far, though.
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	req = req.WithContext(dl.ctx)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return "", errors.New(res.Status)
+	}
+	_, ok := res.Header["Docker-Content-Digest"]
+	if !ok {
+		return "", fmt.Errorf("Docker-Content-Digest is not included in the response header.")
+	}
+	digest = res.Header["Docker-Content-Digest"][0]
+	return digest, nil
+}
+
+// gcr.io specific registryController
+type gcrRegistryController struct {
+	ctx context.Context
+}
+
+func (gl *gcrRegistryController) ownersOfHost(host string) (ownerNames []string, err error) {
+	if metadata.OnGCE() {
+		if proj, _ := metadata.ProjectID(); proj != "" {
+			return []string{proj}, nil
+		}
+	}
+	return nil, nil
+}
+
+func (gl *gcrRegistryController) imagesOfOwner(host, owner string) (imageNames []string, err error) {
+	scheme, err := schemeByHost(host)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("GET", scheme+"://"+host+"/v2/"+owner+"/tags/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	// TODO: auth. This works for public stuff so far, though.
+	req = req.WithContext(gl.ctx)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil, errors.New(res.Status)
+	}
+	var resj struct {
+		Images []string `json:"child"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&resj); err != nil {
+		return nil, err
+	}
+	sort.Strings(resj.Images)
+	return resj.Images, nil
+}
+
+func (gl *gcrRegistryController) tagsOfImage(host, owner, image string) (tagDigests []string, tagsMap map[string] string, err error) {
+	repo, err := namepkg.NewRepository(host + "/" + owner + "/" + image)
+	if err != nil {
+		log.Printf("bad name: %v", err)
+		return nil, nil, err
+	}
+	tags, err := google.List(repo)
+	if err != nil {
+		log.Printf("list: %v", err)
+		return nil, nil, err
+	}
+	t := []string{}
+	m := map[string]string{}
+	for k, mi := range tags.Manifests {
+		t = append(t, k)
+		for _, tag := range mi.Tags {
+			m[tag] = k
+		}
+	}
+	sort.Strings(t)
+	return t, m, nil
 }
 
 type dirEnt struct {
@@ -485,6 +689,7 @@ type layerHost struct {
 	host  string
 	inode uint64
 	dirEnts
+	registry registryController
 }
 
 func newLayerHost(fs *FS, host string, inode uint64) *layerHost {
@@ -493,13 +698,27 @@ func newLayerHost(fs *FS, host string, inode uint64) *layerHost {
 		host:  host,
 		inode: inode,
 	}
+	if isGCR(host) {
+		// TODO: Auth, etc. by adding context.
+		ctx := context.Background()
+		n.registry = &gcrRegistryController{
+			ctx: ctx,
+		}
+	} else {
+		// TODO: Auth, etc. by adding context.
+		ctx := context.Background()
+		n.registry = &defaultRegistryController{
+			ctx: ctx,
+			fs: fs,
+		}
+	}
 	n.dirEnts = dirEnts{
 		initChildren: func(de *dirEnts) {
-			if !isGCR(n.host) || !metadata.OnGCE() {
-				return
-			}
-			if proj, _ := metadata.ProjectID(); proj != "" {
-				n.addLayerHostOwnerLocked(proj)
+			// Get next level (GCP project, docker hub owner) by registry API.
+			if owners, err := n.registry.ownersOfHost(n.host) ; err == nil {
+				for _, o := range owners {
+					n.addLayerHostOwnerLocked(o)
+				}
 			}
 		},
 	}
@@ -524,6 +743,7 @@ func (n *layerHost) addLayerHostOwnerLocked(owner string) { // owner == GCP proj
 				host:  n.host,
 				owner: owner,
 				inode: inode,
+				registry: n.registry,
 			}, nil
 		},
 	}
@@ -563,6 +783,7 @@ type layerHostOwner struct {
 	inode uint64
 	host  string // "gcr.io"
 	owner string // "foo-proj" (GCP project, docker hub owner)
+	registry registryController
 }
 
 func (n *layerHostOwner) Attr(ctx context.Context, a *fuse.Attr) error {
@@ -572,7 +793,8 @@ func (n *layerHostOwner) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (n *layerHostOwner) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
-	images, err := n.fs.imagesOfHost(ctx, n.host, n.owner)
+	// Get next level (image names) by registry API.
+	images, err := n.registry.imagesOfOwner(n.host, n.owner)
 	if err != nil {
 		return nil, err
 	}
@@ -584,21 +806,16 @@ func (n *layerHostOwner) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, er
 
 func (n *layerHostOwner) Lookup(ctx context.Context, imageName string) (fspkg.Node, error) {
 	// TODO: auth, dockerhub, context
-	repo, err := namepkg.NewRepository(n.host + "/" + n.owner + "/" + imageName)
-	if err != nil {
-		log.Printf("bad name: %v", err)
-		return nil, err
-	}
-	tags, err := google.List(repo)
+
+	// Get next level (tag digests, and maps from digest to tag name) by registry API.
+	tagDigests, m, err := n.registry.tagsOfImage(n.host, n.owner, imageName)
 	if err != nil {
 		log.Printf("list: %v", err)
 		return nil, err
 	}
-	m := map[string]string{}
-	for k, mi := range tags.Manifests {
-		for _, tag := range mi.Tags {
-			m[tag] = k
-		}
+	tags := map[string]bool{}
+	for _, t := range tagDigests {
+		tags[t] = true
 	}
 	return &layerHostOwnerImage{
 		fs:      n.fs,
@@ -624,7 +841,7 @@ type layerHostOwnerImage struct {
 	host    string // "gcr.io"
 	owner   string // "foo-proj" (GCP project, docker hub owner)
 	image   string // "ubuntu"
-	tags    *google.Tags
+	tags    map[string]bool
 	tagsMap map[string]string // "latest" -> "sha256:fooo"
 }
 
@@ -638,7 +855,7 @@ func uncolon(s string) string { return strings.Replace(s, ":", "-", 1) }
 func recolon(s string) string { return strings.Replace(s, "-", ":", 1) }
 
 func (n *layerHostOwnerImage) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
-	for k := range n.tags.Manifests {
+	for k := range n.tags {
 		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: uncolon(k)})
 	}
 	for k := range n.tagsMap {
@@ -653,7 +870,7 @@ func (n *layerHostOwnerImage) Lookup(ctx context.Context, name string) (fspkg.No
 	}
 
 	withColon := recolon(name)
-	if _, ok := n.tags.Manifests[withColon]; ok {
+	if _, ok := n.tags[withColon]; ok {
 		mf, err := n.fs.getManifest(ctx, n.host, n.owner, n.image, withColon)
 		if err != nil {
 			log.Printf("getManifest: %v", err)
@@ -740,7 +957,11 @@ func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) 
 	// So add a Range header to bound response size. gcr.io ignores the Range request header,
 	// but if gcr changes its behavior or we're hitting a different registry implementation,
 	// then we don't want to download the full thing.
-	urlStr := "https://" + n.host + "/v2/" + n.owner + "/" + n.image + "/blobs/" + refColon
+	scheme, err := schemeByHost(n.host)
+	if err != nil {
+		return nil, err
+	}
+	urlStr := scheme + "://" + n.host + "/v2/" + n.owner + "/" + n.image + "/blobs/" + refColon
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
 		return nil, err

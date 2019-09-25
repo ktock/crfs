@@ -327,8 +327,6 @@ func (dl *defaultRegistryController) tagsOfImage (host, owner, image string) (ta
 		if d, err := dl.digestOfTag(host, owner, image, t) ; err == nil {
 			tags = append(tags, d)
 			m[t] = d
-		} else {
-			return nil, nil, err
 		}
 	}
 	sort.Strings(tags)
